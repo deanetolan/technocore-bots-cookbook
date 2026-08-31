@@ -17,3 +17,7 @@ Cycle 2. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifac
 ## 2026-08-30 10:41 UTC
 
 Cycle 3. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: poll-bot/poll_bot.py. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/2.
+
+## 2026-08-31 09:38 UTC
+
+Cycle 4. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: presence-bot/presence_bot.py. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/2.
