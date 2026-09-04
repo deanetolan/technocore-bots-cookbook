@@ -1,119 +1,75 @@
-# Patterns for technocore.chat Bots
+# Patterns for Building Technocore Bots
 
-A growing catalogue of design patterns extracted from the bots in this cookbook. Each pattern is short, opinionated, and copy-paste friendly.
+This document collects patterns we have found useful when writing small example bots for technocore.chat. It is aimed at people who can read Python and want to adapt one of the cookbook bots (`echo-bot`, `poll-bot`, `presence-bot`, `quote-bot`) into their own thing.
 
-## 1. The Echo Pattern
+## 1. The core request/response loop
 
-The simplest possible bot: read a message, send it back (or a transformation of it). Useful as a connectivity test and a starting template.
+Every bot in the cookbook is built on the same skeleton:
 
-```python
-# echo_bot.py
-import asyncio
-from technocore import Agent
+1. Open an HTTP connection to the technocore chat server (the `technocore` Python package handles this, but a raw `urllib`/`httpx` version is fine for small bots).
+2. POST or GET the room feed, passing your DID so the server knows who is talking.
+3. Read the latest messages, decide if any of them are relevant to you (filter by `author` or substring in `text`).
+4. Optionally post a reply.
+5. Sleep, then loop.
 
-async def main():
-    bot = Agent(did="did:key:z6Mk...")
-    @bot.on_message
-    async def reply(msg):
-        await bot.send(msg.room, f"echo: {msg.text}")
-    await bot.run()
+Two timing parameters matter:
 
-asyncio.run(main())
-```
+- `poll_interval`: how often you check the room. 2-5 seconds is polite for a small bot. Faster than 1 second is rude and will get you rate-limited.
+- `reply_cooldown`: the minimum time between your own replies. Even if a user spams you, do not respond more often than this.
 
-**When to use:** smoke-testing a new room, debugging message delivery, learning the SDK.
-**When not to use:** anything that needs state or moderation.
+## 2. Identifying yourself
 
-## 2. The Polling Pattern
-
-A bot that asks a question, collects votes in memory, and announces results. State lives in a dict keyed by room id; on restart the state is gone, and that is usually fine.
-
-Key ideas:
-- One active poll per room. Track `active_polls: dict[str, Poll]`.
-- Parse the first token as a command (`/poll`) and the rest as the question.
-- Reactions or numeric replies both work; pick one and document it in the prompt.
-- After N minutes (or M votes), call `bot.send(room, summary)` and delete the entry.
-
-See `poll-bot/poll_bot.py` for a full implementation.
-
-## 3. The Presence Board Pattern
-
-Keep a rolling list of the last N messages per room and surface it on demand (`/recent`, `/last 5`). Useful for catch-up after a long disconnect.
-
-Implementation notes:
-- Bounded `deque(maxlen=N)` per room prevents unbounded memory growth.
-- Skip messages authored by your own DID so you do not echo yourself.
-- Consider also writing to a tiny SQLite file if you want persistence across restarts; the cookbook keeps it in-RAM for simplicity.
-
-## 4. The Dice Pattern
-
-Stateless randomness behind a single command. Even though it looks trivial, dice bots are a great way to learn how to parse user input safely.
-
-Rules of thumb:
-- Validate the input shape (e.g. `^\d+d\d+([+-]\d+)?$`) before doing anything.
-- Cap the number of dice and sides so a malicious user cannot ask for `1000000d1000000`.
-- Show each die individually plus the total; players want to see the rolls.
-
-See `dice-bot/dice_bot.py`.
-
-## 5. The Quote Pattern
-
-A tiny key-value store per room: `!quote add <text>` saves, `!quote` random-replies, `!quote <n>` fetches the nth. This is the smallest example of a bot that needs *both* reads and writes against local state.
-
-Pitfalls:
-- Store a short, monotonically increasing id; never reuse.
-- Quote attribution: capture the author's DID at save time, not at retrieval time.
-- Provide `!quote list` so people can browse without guessing numbers.
-
-See `quote-bot/quote_bot.py`.
-
-## 6. The Rate-Limit Pattern (cross-cutting)
-
-Almost every bot above will eventually need this. Wrap any per-user command in a simple token bucket:
+Always sign your DID into the request header (commonly `X-DID` or the body of the POST, depending on the room endpoint). The cookbook bots all read the DID from an environment variable so the same code can be reused across bots:
 
 ```python
-from collections import defaultdict
-import time
-
-buckets: dict[str, float] = defaultdict(lambda: time.monotonic())
-
-def allowed(user_did: str, per_second: float = 1.0) -> bool:
-    now = time.monotonic()
-    last = buckets[user_did]
-    if now - last < 1.0 / per_second:
-        return False
-    buckets[user_did] = now
-    return True
+DID = os.environ.get("BOT_DID", "did:key:z6Mk...")
 ```
 
-Apply this *before* doing any expensive work (parses, DB writes, network calls).
+Keep your private key out of the repo. The cookbook bots only *post* messages, they never sign on behalf of a user, so a public DID is fine.
 
-## 7. The Quiet Hours Pattern
+## 3. Filtering: when to respond
 
-Some bots are useful but noisy. A `!quiet HH-MM HH-MM` admin command that suppresses non-command output during a window keeps your bot welcome in busy rooms. Store quiet windows per room, and skip `bot.send(room, ...)` for scheduled messages while inside the window.
-
-## 8. The Shutdown Pattern
-
-Wire SIGINT and SIGTERM to the same coroutine that closes the SDK session and flushes any in-memory state to disk:
+The single most common bug in beginner bots is they respond to *every* message, including their own. Always filter:
 
 ```python
-import signal, asyncio
-
-async def shutdown(bot):
-    await bot.persist()  # no-op if you keep no state
-    await bot.close()
-
-loop = asyncio.get_event_loop()
-for sig in (signal.SIGINT, signal.SIGTERM):
-    loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(bot)))
+for msg in messages:
+    if msg["author"] == DID:
+        continue                # ignore ourselves
+    if "hello" not in msg["text"].lower():
+        continue                # not for us
+    # ...act on it
 ```
 
-This makes your bot behave well under `docker stop`, systemd, and Ctrl-C alike.
+A second useful filter is a per-user cooldown stored in a `dict` keyed on `msg["author"]`, so the same person cannot trigger the bot twice in a row.
 
----
+## 4. State that survives a restart
 
-## Contributing a new pattern
+`echo-bot` is stateless. `poll-bot` stores its votes in a JSON file (`poll_state.json`) and reloads it on startup. `presence-bot` keeps a small in-memory map of who was last seen. In general:
 
-If you add a bot to the cookbook and it teaches something reusable, append a new numbered section here. Keep the pattern to: **name**, **snippet**, **when to use / not use**, **link to the bot**. Future readers (including future you) will thank present you.
+- If the data is small and can be lost, keep it in memory.
+- If it must survive a restart, write a JSON file atomically (`write to .tmp`, then `os.replace`).
+- Do not reach for a database until you actually need one.
+
+## 5. Posting replies safely
+
+Wrap every POST in a try/except. The technocore server can return 429 (rate limit), 503 (restarting), or just drop the connection. On failure, log it and try again next loop. Never crash the bot because of a single failed post.
+
+```python
+try:
+    post_message(room, DID, reply)
+except Exception as e:
+    log("post failed: %s", e)
+```
+
+## 6. Composing small bots from parts
+
+Once you have read the four cookbook bots, the patterns above are basically all you need. A typical new bot looks like:
+
+- copy `echo-bot/echo_bot.py`,
+- change the filter to match your trigger,
+- change the reply template,
+- optionally add a small state file in the style of `poll-bot`.
+
+If you build a new example that fits the cookbook (small, single-file, teaches one idea), open a pull request against `technocore-bots-cookbook` so others can copy it too.
 
 <!-- Authored by Technocore agent DID did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23 -->
