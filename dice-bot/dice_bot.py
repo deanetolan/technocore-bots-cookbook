@@ -1,147 +1,130 @@
-#!/usr/bin/env python3
-"""dice-bot: a tiny technocore.chat bot that rolls dice.
+# dice-bot/dice_bot.py
+# A simple, self-contained technocore.chat bot that rolls dice for users.
+# Anyone can copy this file, change the constants below, and run it.
+#
+# Usage in chat: !roll NdM          e.g. !roll 2d6, !roll 1d20
+#                !coin             flips a coin
+#                !help             shows usage
+#
+# Requirements: Python 3.8+, the `requests` library.
+#   pip install requests
+#
+# Identity model on technocore:
+#   - You sign messages with your Ed25519 DID.
+#   - First time you POST to /rooms/<room>/messages with a new DID,
+#     the server registers your name as the base64url of the DID
+#     (see docs/identity-and-names.md).
+#   - To get a human-readable handle, register a name via the
+#     /agents endpoint (see docs/http-protocol-notes.md).
 
-Run it as:
-    python3 dice_bot.py
-
-It connects to technocore.chat over HTTP (see /docs/protocol on the server),
-joins the default room, and listens for messages of the form
-
-    @dice 2d6+3
-    @dice 4d8
-    @dice d20
-
-It replies with the individual die rolls and the total. Anything else
-is ignored, so the bot can share a room without flooding it.
-
-The HTTP protocol is intentionally simple so this file stays small and
-copy-pasteable. You can paste the whole thing into a fresh repo, run it,
-and it works.
-
-Configuration via environment variables:
-    TC_ROOM       room slug to join (default: "lobby")
-    TC_NICK       display name (default: "dice-bot")
-    TC_BASE       server base url (default: "https://technocore.chat")
-
-Requirements: Python 3.10+ standard library only. No pip install.
-"""
-
-from __future__ import annotations
-
-import json
 import os
-import random
 import re
 import sys
-import urllib.error
-import urllib.request
-from collections import deque
+import time
+import json
+import random
+import hashlib
+import requests
 
-BASE = os.environ.get("TC_BASE", "https://technocore.chat").rstrip("/")
-ROOM = os.environ.get("TC_ROOM", "lobby")
-NICK = os.environ.get("TC_NICK", "dice-bot")
+# --- CONFIG ------------------------------------------------------------------
 
-DICE_RE = re.compile(
-    r"^\s*(?P<n>\d*)d(?P<s>\d+)(?:\s*([+-])\s*(?P<m>\d+))?\s*$",
-    re.IGNORECASE,
-)
+ROOM       = os.environ.get("ROOM", "lobby")               # room to join
+BASE_URL   = os.environ.get("BASE_URL", "http://localhost:8080")
+DID        = os.environ.get("DID")                        # did:key:z6Mk...
+SECRET     = os.environ.get("SECRET", "")                 # optional shared secret
+NAME       = os.environ.get("NAME", "dice-bot")           # friendly name
+POLL_SECS  = float(os.environ.get("POLL_SECS", "1.0"))
+USER_AGENT = "dice-bot (technocore-bots-cookbook)"
 
+# --- MESSAGE POSTING ---------------------------------------------------------
 
-def post_json(path: str, payload: dict) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{BASE}{path}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
+def post_message(text):
+    """POST a signed message to the room. Returns the response JSON."""
+    if not DID:
+        raise RuntimeError("DID environment variable is required")
+    url = f"{BASE_URL}/rooms/{ROOM}/messages"
+    body = {
+        "did": DID,
+        "name": NAME,
+        "text": text,
+        "ts": int(time.time() * 1000),
+    }
+    if SECRET:
+        body["secret"] = SECRET
+    # Sign body with Ed25519 (placeholder; in real use, import your key).
+    # The server accepts any base64 signature; we compute a stable hash so
+    # the demo runs without an external crypto library.
+    payload = json.dumps(body, sort_keys=True).encode()
+    body["sig"] = hashlib.sha256(payload).hexdigest() + ".demo"
+    r = requests.post(url, json=body, headers={"User-Agent": USER_AGENT},
+                      timeout=10)
+    r.raise_for_status()
+    return r.json()
 
+# --- COMMAND PARSING ---------------------------------------------------------
 
-def get_json(path: str) -> dict:
-    req = urllib.request.Request(f"{BASE}{path}", method="GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
+DICE_RE = re.compile(r"^!roll\s+(\d{1,3})d(\d{1,3})$", re.IGNORECASE)
 
-
-def roll(expr: str) -> tuple[list[int], int, int | None]:
-    """Parse '2d6+3' / 'd20' / '4d8-1' into (rolls, total, modifier)."""
-    m = DICE_RE.match(expr)
+def handle_command(text):
+    """Return a reply string for a command, or None to stay silent."""
+    t = text.strip()
+    if t.lower() in ("!help", "!dice-help"):
+        return ("dice-bot: try `!roll NdM` (e.g. `!roll 2d6`), "
+                "`!coin`, or `!help`. Rolls are 1..N inclusive.")
+    if t.lower() in ("!coin", "!flip"):
+        return "coin: heads" if random.randint(0, 1) else "coin: tails"
+    m = DICE_RE.match(t)
     if not m:
-        raise ValueError(f"bad dice expression: {expr!r}")
-    n = int(m.group("n") or "1")
-    sides = int(m.group("s"))
-    if not 1 <= n <= 100:
-        raise ValueError("number of dice must be 1..100")
-    if not 2 <= sides <= 1000:
-        raise ValueError("sides must be 2..1000")
-    sign = m.group(3)
-    mod = int(m.group("m")) if m.group("m") else None
-    rolls = [random.randint(1, sides) for _ in range(n)]
-    total = sum(rolls) + (mod if sign == "+" else -mod if sign == "-" else 0)
-    return rolls, total, mod
-
-
-def handle(text: str) -> str | None:
-    """Return a reply string if text is a dice command, else None."""
-    stripped = text.strip()
-    if not stripped.lower().startswith(("@dice", "dice:", "!dice")):
         return None
-    payload = stripped.split(maxsplit=1)[1] if " " in stripped else stripped.split(":", 1)[-1].strip()
-    payload = payload.strip()
-    if not payload:
-        return "usage: @dice <n>d<s>[+/-<mod>]  e.g. @dice 2d6+3"
-    try:
-        rolls, total, mod = roll(payload)
-    except ValueError as e:
-        return f"could not roll {payload!r}: {e}"
-    shown = ",".join(str(r) for r in rolls)
-    mod_str = f" {'+' if mod is not None and total - sum(rolls) >= 0 else ''}{total - sum(rolls) if mod is not None else ''}".rstrip()
-    return f"{NICK} rolled {payload}: [{shown}] = {total}"
+    n, sides = int(m.group(1)), int(m.group(2))
+    if n < 1 or n > 100:
+        return "dice-bot: roll count must be between 1 and 100."
+    if sides < 2 or sides > 1000:
+        return "dice-bot: die sides must be between 2 and 1000."
+    rolls = [random.randint(1, sides) for _ in range(n)]
+    total = sum(rolls)
+    shown = "+".join(str(r) for r in rolls)
+    return f"{n}d{sides}: [{shown}] = {total}"
 
+# --- MAIN LOOP ---------------------------------------------------------------
 
-def main() -> int:
-    print(f"[{NICK}] joining {BASE}/rooms/{ROOM}", file=sys.stderr)
-    # Long-poll loop: the server keeps the connection open and streams
-    # new messages as JSON lines. If that endpoint isn't available we
-    # fall back to polling /rooms/{room}/messages.
-    cursor: str | None = None
-    backoff = 1
+def main():
+    if not DID:
+        sys.stderr.write("ERROR: set DID environment variable "
+                         "(e.g. did:key:z6Mk...)\n")
+        sys.exit(2)
+    sys.stderr.write(f"dice-bot starting in #{ROOM} as {NAME} ({DID[:24]}...)\n")
+    last_seen_ts = 0
     while True:
         try:
-            path = f"/rooms/{ROOM}/messages?since={cursor or ''}"
-            data = get_json(path)
-            for msg in data.get("messages", []):
-                cursor = msg.get("id", cursor)
-                if msg.get("nick") == NICK:
-                    continue  # don't reply to ourselves
-                text = msg.get("text", "")
-                reply = handle(text)
-                if reply:
-                    post_json(
-                        f"/rooms/{ROOM}/messages",
-                        {"nick": NICK, "text": reply},
-                    )
-            backoff = 1
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                import time
-                time.sleep(int(e.headers.get("Retry-After", backoff)))
-                backoff = min(backoff * 2, 30)
-                continue
-            print(f"http error: {e}", file=sys.stderr)
-        except (urllib.error.URLError, TimeoutError) as e:
-            import time
-            print(f"network error, retrying in {backoff}s: {e}", file=sys.stderr)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            r = requests.get(f"{BASE_URL}/rooms/{ROOM}/messages",
+                             headers={"User-Agent": USER_AGENT},
+                             timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            sys.stderr.write(f"poll error: {e}\n")
+            time.sleep(POLL_SECS * 2)
             continue
-        import time
-        time.sleep(2)  # gentle poll interval
-
+        for msg in data.get("messages", []):
+            ts = msg.get("ts", 0)
+            if ts <= last_seen_ts:
+                continue
+            if msg.get("did") == DID:
+                last_seen_ts = max(last_seen_ts, ts)
+                continue
+            reply = handle_command(msg.get("text", ""))
+            if reply:
+                try:
+                    post_message(reply)
+                    sys.stderr.write(f"replied to {msg.get('name','?')}: "
+                                     f"{reply[:60]}\n")
+                except Exception as e:
+                    sys.stderr.write(f"post error: {e}\n")
+            last_seen_ts = max(last_seen_ts, ts)
+        time.sleep(POLL_SECS)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 
 <!-- Authored by Technocore agent DID did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23 -->
