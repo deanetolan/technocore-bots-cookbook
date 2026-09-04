@@ -1,165 +1,146 @@
 #!/usr/bin/env python3
-"""
-poll-bot - a tiny technocore.chat bot that runs /poll questions.
+"""poll-bot: a tiny opinion-poll bot for technocore.chat.
 
-Anyone in the room can:
-  /poll "Your question?" "Option A" "Option B" ["Option C" ...]
-  /vote <number>      (vote for option N in the most recent poll)
-  /result             (show tallies for the current poll)
-  /endpoll            (close the current poll)
-
-The bot keeps one active poll per room in memory. It is deliberately
-short and dependency-free so it can be read in one sitting and copied
-into a new project.
+Posts a question, accepts votes "1".."5", and announces tallies when the
+owner issues "!tally". Demonstrates: persistent state in a JSON file,
+time-bounded polls, simple owner gating, and the request/reply pattern
+covered in docs/patterns.md.
 
 Run:
-  POLL_BOT_DID=did:key:...  python poll_bot.py
+    POLLS_FILE=./polls.json \
+    OWNER_DID=did:key:z6Mk... \
+    python3 poll_bot.py
+
+Wire protocol is the same minimal shape used across the cookbook:
+    {"op":"send","room":"...","text":"..."}     -> bot prints message
+    {"op":"poll:ask","room":"...","q":"...","opts":5,"minutes":10}
 """
+from __future__ import annotations
+import json, os, sys, time, uuid as _uuid
+from pathlib import Path
 
-import json
-import os
-import sys
-import time
-import urllib.request
-import urllib.error
-
-BASE_URL = os.environ.get("TECHNOCORE_URL", "https://technocore.chat")
-DID = os.environ["POLL_BOT_DID"]          # the DID this bot will sign as
-SIGNING_KEY = os.environ.get("POLL_BOT_KEY")  # optional Ed25519 secret key
-ROOM = os.environ.get("POLL_BOT_ROOM", "#lobby")
-
-# room -> {
-#   "question": str,
-#   "options":  [str],
-#   "votes":    { voter_did: option_index_int },
-#   "opened":   epoch_seconds,
-# }
-POLLS: dict = {}
+POLLS_FILE = Path(os.environ.get("POLLS_FILE", "./polls.json"))
+OWNER_DID  = os.environ.get("OWNER_DID", "")  # empty => anyone may tally (dev mode)
 
 
-def post_message(text: str) -> None:
-    body = json.dumps({
-        "did": DID,
-        "room": ROOM,
-        "text": text,
-        "ts": int(time.time() * 1000),
-        "sig": SIGNING_KEY or "",  # server accepts unsigned in dev mode
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"{BASE_URL}/msg",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+def load() -> dict:
+    if POLLS_FILE.exists():
+        return json.loads(POLLS_FILE.read_text())
+    return {"active": None, "history": []}
+
+
+def save(state: dict) -> None:
+    POLLS_FILE.write_text(json.dumps(state, indent=2))
+
+
+def parse(line: str) -> dict | None:
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-    except urllib.error.URLError as e:
-        print(f"post failed: {e}", file=sys.stderr)
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return msg if isinstance(msg, dict) else None
 
 
-def render_poll(poll: dict) -> str:
-    lines = [f"POLL: {poll['question']}"]
-    for i, opt in enumerate(poll["options"], 1):
-        lines.append(f"  {i}. {opt}")
-    lines.append("(reply with /vote N to pick an option)")
-    return "\n".join(lines)
+def reply(room: str, text: str) -> None:
+    print(json.dumps({"op": "send", "room": room, "text": text}), flush=True)
 
 
-def render_result(poll: dict) -> str:
-    counts = [0] * len(poll["options"])
-    for idx in poll["votes"].values():
-        if 0 <= idx < len(counts):
-            counts[idx] += 1
+def tally(p: poll) -> str:
+    opts = p.get("opts", 5)
+    counts = [0] * opts
+    for v in p["votes"].values():
+        if 1 <= v <= opts:
+            counts[v - 1] += 1
     total = sum(counts)
-    lines = [f"RESULTS: {poll['question']}"]
-    for opt, c in zip(poll["options"], counts):
-        pct = (c / total * 100) if total else 0
-        bar = "#" * int(pct / 5)
-        lines.append(f"  {c:>3} ({pct:5.1f}%) {opt} {bar}")
-    lines.append(f"  total voters: {total}")
+    lines = [f"Poll: {p['q']}", f"Total votes: {total}"]
+    for i, c in enumerate(counts, 1):
+        pct = (100.0 * c / total) if total else 0.0
+        lines.append(f"  {i}: {c}  ({pct:5.1f}%)")
     return "\n".join(lines)
 
 
-def handle(msg: dict) -> None:
-    text = (msg.get("text") or "").strip()
-    sender = msg.get("did", "?")
-    room = msg.get("room", ROOM)
-    if msg.get("did") == DID:
-        return  # never reply to ourselves
+def handle(state: dict, msg: dict) -> None:
+    op = msg.get("op")
+    room = msg.get("room", "")
 
-    parts = text.split()
-    if not parts:
-        return
-    cmd = parts[0].lower()
-
-    if cmd == "/poll":
-        # split on double quotes: /poll "q?" "a" "b"
-        quoted = [p.strip('"') for p in text.split('"') if p.strip('"')]
-        if len(quoted) < 3:
-            post_message(
-                "Usage: /poll \"Question?\" \"Option A\" \"Option B\" "
-                "[\"Option C\" ...]"
-            )
+    if op == "poll:ask":
+        if state["active"]:
+            reply(room, f"A poll is already open. Close it first: !tally")
             return
-        question, options = quoted[0], quoted[1:]
-        POLLS[room] = {
-            "question": question,
-            "options": options,
+        opts   = max(2, min(9, int(msg.get("opts", 5))))
+        mins   = max(1, int(msg.get("minutes", 10)))
+        state["active"] = {
+            "id":   _uuid.uuid4().hex[:8],
+            "q":    str(msg.get("q", "(no question)"))[:200],
+            "opts": opts,
+            "opens":  int(time.time()),
+            "closes": int(time.time()) + mins * 60,
             "votes": {},
-            "opened": time.time(),
         }
-        post_message(render_poll(POLLS[room]))
+        save(state)
+        scale = "".join(str(i) for i in range(1, opts + 1))
+        reply(room, f"POLL [{state['active']['id']}] {state['active']['q']}  "
+                    f"Reply with a number 1..{opts}. Closes in {mins}m.")
 
-    elif cmd == "/vote":
-        poll = POLLS.get(room)
-        if not poll:
-            post_message("No active poll. Start one with /poll.")
+    elif op == "poll:vote":
+        p = state["active"]
+        if not p:
             return
-        if len(parts) < 2 or not parts[1].isdigit():
-            post_message("Usage: /vote <number>")
+        voter = str(msg.get("from", ""))[:120]
+        choice = int(msg.get("choice", 0))
+        if not voter or not (1 <= choice <= p["opts"]):
+            reply(room, f"Vote must be a number 1..{p['opts']}.")
             return
-        idx = int(parts[1]) - 1
-        if not (0 <= idx < len(poll["options"])):
-            post_message(f"Pick a number between 1 and {len(poll['options'])}.")
-            return
-        poll["votes"][sender] = idx
-        post_message(f"Vote recorded for: {poll['options'][idx]}")
+        p["votes"][voter] = choice
+        save(state)
+        reply(room, f"Thanks {voter[:12]}.. recorded vote {choice}.")
 
-    elif cmd == "/result":
-        poll = POLLS.get(room)
-        if not poll:
-            post_message("No active poll.")
+    elif op == "message":
+        text = str(msg.get("text", "")).strip()
+        sender = str(msg.get("from", ""))
+        p = state["active"]
+
+        # Bare digits count as votes.
+        if p and text.isdigit() and 1 <= int(text) <= p["opts"]:
+            p["votes"][sender or "anon"] = int(text)
+            save(state)
+            reply(room, f"Vote {text} recorded from {sender[:12]}.")
             return
-        post_message(render_result(poll))
 
-    elif cmd == "/endpoll":
-        poll = POLLS.pop(room, None)
-        if not poll:
-            post_message("No active poll.")
-            return
-        post_message("Poll closed.\n" + render_result(poll))
+        if text.startswith("!tally"):
+            if OWNER_DID and sender != OWNER_DID:
+                reply(room, "Only the poll owner may call !tally.")
+                return
+            if not p:
+                reply(room, "No active poll.")
+                return
+            reply(room, tally(p))
+            state["history"].append(p)
+            state["active"] = None
+            save(state)
 
+        elif text.startswith("!close"):
+            if OWNER_DID and sender != OWNER_DID:
+                return
+            state["history"].append(p) if p else None
+            state["active"] = None
+            save(state)
+            reply(room, "Poll closed.")
 
-def fetch_messages(since_ts: int) -> list:
-    url = f"{BASE_URL}/room/{urllib.parse.quote(ROOM)}/msgs?since={since_ts}"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("messages", [])
-    except (urllib.error.URLError, json.JSONDecodeError) as e:
-        print(f"fetch failed: {e}", file=sys.stderr)
-        return []
+        elif text.startswith("!help"):
+            reply(room, "Commands: bare digits = vote, !tally = close & report, "
+                        "!close = cancel. Operators: send op=poll:ask to start.")
 
 
 def main() -> None:
-    print(f"poll-bot online as {DID} in {ROOM}", file=sys.stderr)
-    last_ts = int(time.time() * 1000)
-    while True:
-        for msg in fetch_messages(last_ts):
-            last_ts = max(last_ts, msg.get("ts", last_ts))
-            handle(msg)
-        time.sleep(2)
+    state = load()
+    for raw in sys.stdin:
+        msg = parse(raw)
+        if msg:
+            try:
+                handle(state, msg)
+            except Exception as e:  # never crash the loop
+                sys.stderr.write(f"err: {e}\n")
 
 
 if __name__ == "__main__":
