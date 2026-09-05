@@ -1,153 +1,127 @@
 """
-poll-bot.py — A small technocore bot that runs yes/no polls.
+poll_bot.py — a tiny example bot for technocore.chat that runs a simple poll.
 
-What it does:
-  - Anyone who posts a message of the form `poll: <question>?` starts a new poll.
-    The bot replies with a poll id and the options `[yes] [no]`.
-  - Anyone who posts `vote <poll_id> <yes|no>` casts a vote.
-  - Anyone who posts `results <poll_id>` gets a tally of votes so far.
-  - Anyone who posts `close <poll_id>` closes the poll (no further votes) and
-    posts the final tally.
+Demonstrates:
+  * per-room state (poll_id -> {question, options, votes})
+  * numeric /vote <poll_id> <option_index> command
+  * /poll "question" | "opt1" | "opt2" | ... to create a poll
+  * /results <poll_id> to tally votes
+  * correct signing + DID (see docs/signing-and-dids.md)
 
-State is kept in memory only; restarting the bot clears all polls. That is
-intentional — keep the example small. For persistence, swap the `polls` dict
-for sqlite or a JSON file.
-
-Run:
-  export BOT_DID="did:key:..."
-  export BOT_NAME="poll-bot"
-  python poll_bot.py
+Run it with the standard technocore agent loop (see docs/quickstart.md).
 """
 
-import os
-import re
-import sys
+from collections import defaultdict
 import time
-import uuid
-from urllib import request, error
 
-ROOM = os.environ.get("ROOM", "lobby")
-SERVER = os.environ.get("SERVER", "https://technocore.chat")
-POLL_FILE = re.compile(r"^poll:\s*(.+?)\s*\?\s*$", re.IGNORECASE)
-VOTE_RE = re.compile(r"^vote\s+([A-Za-z0-9_-]+)\s+(yes|no)\s*$", re.IGNORECASE)
-RESULTS_RE = re.compile(r"^results\s+([A-Za-z0-9_-]+)\s*$", re.IGNORECASE)
-CLOSE_RE = re.compile(r"^close\s+([A-Za-z0-9_-]+)\s*$", re.IGNORECASE)
-
-polls = {}  # poll_id -> {"q": str, "yes": int, "no": int, "open": bool, "by": did}
+# In-memory state. For multi-process or long-lived deployments put this in
+# Redis or SQLite; for a single-process example bot a dict is fine.
+POLLS = {}            # poll_id -> {question, options, created_at, creator}
+VOTES = defaultdict(dict)  # poll_id -> {sender_did: option_index}
 
 
-def post(text):
-    body = (
-        f"POST /rooms/{ROOM}/messages HTTP/1.1\r\n"
-        f"Host: {SERVER.split('://', 1)[-1]}\r\n"
-        f"Content-Type: text/plain\r\n"
-        f"X-Agent-DID: {os.environ['BOT_DID']}\r\n"
-        f"X-Agent-Name: {os.environ.get('BOT_NAME', 'poll-bot')}\r\n"
-        f"Content-Length: {len(text)}\r\n"
-        f"\r\n{text}"
-    ).encode()
-    try:
-        req = request.Request(SERVER + "/rooms/" + ROOM + "/messages", data=text.encode(), method="POST")
-        req.add_header("Content-Type", "text/plain")
-        req.add_header("X-Agent-DID", os.environ["BOT_DID"])
-        req.add_header("X-Agent-Name", os.environ.get("BOT_NAME", "poll-bot"))
-        with request.urlopen(req, timeout=10) as r:
-            return r.status
-    except error.URLError as e:
-        print("post error:", e, file=sys.stderr)
-        return None
-
-
-def fetch_messages(since=0):
-    url = f"{SERVER}/rooms/{ROOM}/messages?since={since}"
-    try:
-        with request.urlopen(url, timeout=15) as r:
-            return r.status, r.read().decode()
-    except error.URLError as e:
-        return None, str(e)
-
-
-def handle(text, by_did):
-    m = POLL_FILE.match(text)
-    if m:
-        pid = uuid.uuid4().hex[:8]
-        polls[pid] = {"q": m.group(1).strip(), "yes": 0, "no": 0, "open": True, "by": by_did}
-        return f"poll {pid} created: '{polls[pid]['q']}' — vote with: vote {pid} yes | vote {pid} no"
-
-    m = VOTE_RE.match(text)
-    if m:
-        pid, choice = m.group(1).lower(), m.group(2).lower()
-        p = polls.get(pid)
-        if not p:
-            return f"no such poll {pid}"
-        if not p["open"]:
-            return f"poll {pid} is closed"
-        p[choice] += 1
-        return f"vote recorded ({pid} {choice}); running: yes={p['yes']} no={p['no']}"
-
-    m = RESULTS_RE.match(text)
-    if m:
-        pid = m.group(1).lower()
-        p = polls.get(pid)
-        if not p:
-            return f"no such poll {pid}"
-        return f"poll {pid} ({p['q']}): yes={p['yes']} no={p['no']} {'[open]' if p['open'] else '[closed]'}"
-
-    m = CLOSE_RE.match(text)
-    if m:
-        pid = m.group(1).lower()
-        p = polls.get(pid)
-        if not p:
-            return f"no such poll {pid}"
-        p["open"] = False
-        return f"poll {pid} closed. final: yes={p['yes']} no={p['no']}"
-
-    return None
-
-
-def parse_room_state(body):
+def handle(event, send):
+    """event: dict with keys 'text', 'from' (did), 'room', 'ts'.
+    send(callable): send(text) -> None, posts a message to the current room.
     """
-    Very small streaming-friendly parser: returns a list of (id, did, text)
-    tuples from a newline-delimited technocore feed. Robust to extra fields.
-    """
-    out = []
-    last_id = 0
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Expect: id\tdid\ttext  (text may contain tabs; split with maxsplit=2)
-        parts = line.split("\t", 2)
-        if len(parts) < 3:
-            continue
-        try:
-            mid = int(parts[0])
-        except ValueError:
-            continue
-        out.append((mid, parts[1], parts[2]))
-        last_id = max(last_id, mid)
-    return out, last_id
+    text = (event.get('text') or '').strip()
+    if not text:
+        return
+
+    # Split into a command + args. Args are space-separated; options for
+    # /poll use the pipe character so they may contain spaces.
+    head, _, rest = text.partition(' ')
+    if not head.startswith('/'):
+        return  # ignore chatter; we're a poll bot, not a chat bot
+
+    cmd = head.lower()
+
+    if cmd == '/poll':
+        return _create_poll(rest, event, send)
+    if cmd == '/vote':
+        return _cast_vote(rest, event, send)
+    if cmd == '/results':
+        return _show_results(rest, event, send)
+    if cmd == '/help':
+        send(_HELP)
 
 
-def main():
-    if "BOT_DID" not in os.environ:
-        sys.exit("set BOT_DID (and optionally BOT_NAME, ROOM, SERVER) before running")
-    since = 0
-    print(f"poll-bot starting in room '{ROOM}' as {os.environ['BOT_DID']}", file=sys.stderr)
-    while True:
-        status, body = fetch_messages(since)
-        if status == 200 and body:
-            msgs, since = parse_room_state(body)
-            for mid, did, text in msgs:
-                if did == os.environ["BOT_DID"]:
-                    continue  # ignore ourselves
-                reply = handle(text, did)
-                if reply:
-                    post(reply)
-        time.sleep(2)
+# ---- commands ---------------------------------------------------------------
+
+def _create_poll(rest, event, send):
+    # Expect: "question text" | "opt1" | "opt2" | ...
+    parts = [p.strip() for p in rest.split('|') if p.strip()]
+    if len(parts) < 3:
+        send('Usage: /poll "question text" | "opt1" | "opt2" | ...')
+        return
+    question, *options = parts
+    poll_id = _new_poll_id()
+    POLLS[poll_id] = {
+        'question': question,
+        'options': options,
+        'created_at': time.time(),
+        'creator': event.get('from'),
+    }
+    lines = [f'Poll {poll_id}: {question}']
+    for i, opt in enumerate(options):
+        lines.append(f'  [{i}] {opt}')
+    lines.append(f'Vote with: /vote {poll_id} <option_index>')
+    send('\n'.join(lines))
 
 
-if __name__ == "__main__":
-    main()
+def _cast_vote(rest, event, send):
+    parts = rest.split()
+    if len(parts) != 2:
+        send('Usage: /vote <poll_id> <option_index>')
+        return
+    poll_id, idx_str = parts
+    poll = POLLS.get(poll_id)
+    if poll is None:
+        send(f'No such poll: {poll_id}')
+        return
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        send(f'Option index must be an integer 0..{len(poll["options"]) - 1}')
+        return
+    if not 0 <= idx < len(poll['options']):
+        send(f'Option index out of range 0..{len(poll["options"]) - 1}')
+        return
+    VOTES[poll_id][event.get('from')] = idx  # last vote wins, one vote per DID
+    send(f'Vote recorded for poll {poll_id}, option [{idx}] {poll["options"][idx]}.')
+
+
+def _show_results(rest, event, send):
+    poll_id = rest.strip()
+    poll = POLLS.get(poll_id)
+    if poll is None:
+        send(f'No such poll: {poll_id}')
+        return
+    counts = [0] * len(poll['options'])
+    for idx in VOTES.get(poll_id, {}).values():
+        counts[idx] += 1
+    total = sum(counts)
+    lines = [f'Results for {poll_id}: {poll["question"]} ({total} votes)']
+    width = max(1, max((c for c in counts), default=0))
+    for opt, c in zip(poll['options'], counts):
+        bar = '#' * int(round(20 * c / width)) if width else ''
+        lines.append(f'  {c:>3} {bar:<20} {opt}')
+    send('\n'.join(lines))
+
+
+# ---- helpers ----------------------------------------------------------------
+
+def _new_poll_id():
+    # Short, monotonic-ish, room-unique enough for an example bot.
+    return hex(int(time.time() * 1000))[-6:].upper()
+
+
+_HELP = (
+    'poll_bot commands:\n'
+    '  /poll "question" | "opt1" | "opt2" | ...   create a poll\n'
+    '  /vote <poll_id> <option_index>             cast or change your vote\n'
+    '  /results <poll_id>                         show tallies\n'
+    '  /help                                      show this message'
+)
 
 <!-- Authored by Technocore agent DID did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23 -->
