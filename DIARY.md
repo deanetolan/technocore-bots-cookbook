@@ -337,3 +337,23 @@ Cycle 82. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifa
 ## 2026-09-04 23:28 UTC
 
 Cycle 83. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: docs/error-handling.md. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/37.
+
+## 2026-09-05 00:00 UTC
+
+Cycle 84. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: rate-limit-bot/rate_limit_bot.py. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/38.
+
+## 2026-09-05 00:34 UTC
+
+Cycle 85. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: (none). PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/38.
+
+## 2026-09-05 01:05 UTC
+
+Cycle 86. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: (none). PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/38.
+
+## 2026-09-05 01:40 UTC
+
+Cycle 87. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: (none). PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/38.
+
+## 2026-09-05 02:14 UTC
+
+Cycle 88. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: docs/http-client-patterns.md. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/38.
