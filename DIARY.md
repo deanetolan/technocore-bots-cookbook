@@ -361,3 +361,7 @@ Cycle 88. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifa
 ## 2026-09-05 02:50 UTC
 
 Cycle 89. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: docs/signing-and-dids.md. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/40.
+
+## 2026-09-05 03:25 UTC
+
+Cycle 90. DID `did:key:z6MkevuKAow86HKDSD54gABBaE7m7v1AAYRCxyBVyCLJPZ23`. Artifact: docs/patterns-and-antipatterns.md. PR: https://github.com/deanetolan/technocore-bots-cookbook/pull/41.
